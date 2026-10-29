@@ -1,0 +1,559 @@
+Bond-Leads-Equity Signal: Implementation Specification
+Oct 28, 2026 · @A K
+1. Purpose and scope
+The signal detects an issuer-specific abnormal move in a corporate bond spread, decides if the move is information or liquidity, and trades the issuer's equity when the move is information and the stock has not yet moved.
+Outputs per issuer and per bar:
+• z: the standardized abnormal bond move.
+• mu_hat: the expected equity excess return over the target horizon.
+• m: the part of mu_hat that the stock has not yet realized.
+• A trade instruction: direction, size, horizon, and exit conditions.
+• A diagnostic label: information, liquidity, or already priced.
+Two use modes:
+• Alpha mode: trade the stock to capture m.
+• Hedge mode: trade the stock to hedge a bond inventory position against the information component of the move.
+Out of scope for v1:
+• The equity-leads-bond direction.
+• The cash-CDS basis trade.
+• A full capital-structure arbitrage model.
+Prior on the result: equity leads credit in most names most of the time. The expected effect concentrates in high-yield names, negative shocks, and CDS-confirmed moves. The build must confirm the effect in Module B before any execution work starts.
+The left column runs live on every bar. The right band is fitted offline and hands the response model to Module D.
+2. Notation and definitions
+All time series run on one bar clock in New York time. Index i is the issuer, b is a bond of issuer i, t is the bar, and h is a horizon in bars.
+Symbol
+Meaning
+Unit
+s_{b,t}
+Bond spread at bar close (OAS from the quote mid)
+bp
+s_{i,t}
+Issuer spread: duration-weighted mean of eligible bonds
+bp
+Delta log s_{i,t}
+Relative spread change, log(s_t) - log(s_{t-1})
+1
+CDX_t
+Credit index spread (IG or HY by issuer bucket)
+bp
+y_t
+Benchmark Treasury yield (5y for maturity < 7y, else 10y)
+%
+c_{i,t}
+5y CDS par spread of issuer i
+bp
+r^E_{i,t}
+Equity log return from mid to mid
+1
+r^M_t
+Market and sector factor returns
+1
+r~^E_{i,t,t+h}
+Equity excess return over h bars after the factor model
+1
+epsilon_{i,t}
+Residual of the bond model (Module A)
+1
+sigma_hat_{i,t}
+EWMA scale of epsilon
+1
+z_{i,t}
+Standardized abnormal bond move, epsilon / sigma_hat
+1
+Z_{i,t,t+h}
+Cumulative future bond residual relative to the shock
+1
+gamma_h(x)
+Response of r~^E to z at horizon h in state x
+1
+delta_h(x)
+Response of Z to z at horizon h in state x
+1
+x_{i,t}
+State feature vector (Module C)
+mixed
+mu_hat
+Expected equity excess return, gamma_hat_h(x) z
+1
+m_t
+Unrealized part of mu_hat at bar t
+1
+beta_E
+Dollar hedge ratio of the bond to the equity
+1
+t_0
+Availability time of the abnormal move
+bar
+Sign convention: z > 0 means the spread widened more than the model explains. The stock follows the bond when gamma_h < 0.
+3. Data inputs
+The bond leg runs on quote mids. Trades are a secondary input for flow features only.
+Input
+Source
+Frequency
+Fields
+Rule
+Bond quotes
+Own auto-quoter mid first; composite (CP+, ICE, CBBT) as fallback
+Tick, aligned to bars
+bid, ask, mid, OAS, timestamp, size
+Carry forward a stale mid with an update flag
+Bond trades
+TRACE
+Tick
+execution time, report time, price, size (capped), side, contra type
+Keep both timestamps
+Own flow
+RFQ log
+Tick
+side, size, client type, win or lose, quoted level
+Market-maker desks only
+CDS
+Intraday dealer runs or Markit intraday; daily composite as fallback
+Tick or 15 min
+5y par spread, timestamp
+Use the same issuer entity as the bond
+Credit index
+CDX IG and CDX HY on-the-run
+Tick
+spread
+Choose IG or HY by issuer bucket
+Rates
+Treasury benchmark yields or futures
+Tick
+2y, 5y, 10y, 30y
+Match the bond maturity
+Equity
+NBBO mid
+Tick
+bid, ask, timestamp, volume
+Flag pre-market and post-market
+Equity options
+Vol surface snapshots
+15 min
+ATM implied vol, 25-delta skew
+30 to 90 day tenor
+Reference data
+Security master
+Daily
+issuer to ticker map, maturity, coupon, seniority, call schedule, rating, sector
+Map to the listed ultimate parent
+Capital structure
+Fundamentals
+Quarterly
+total debt, market cap, equity vol
+Inputs to the structural delta
+Events
+Earnings calendar, rating actions, macro calendar, index rebalances
+Daily
+date, time, type
+Drives the event filters
+Minimum history for the first build: 3 years of bars that include one stress period. The issuer universe at the start: issuers with at least one eligible bond, a listed equity, and a quoted CDS.
+4. Preprocessing and clock
+Two timestamps govern every bond observation: the execution or quote time measures the move, and the report time decides when the signal can use it.
+4.1 Clock
+1. Bar length is 5 minutes. The bond day runs 08:00 to 17:00 New York. The equity day runs 09:30 to 16:00.
+2. Tag each bar with a session bucket: pre-open, open (09:30 to 10:30), mid, close (15:00 to 16:00), post-close.
+3. Align all inputs to the bar close by the last observation at or before the close.
+4. In the backtest, use the report time to decide availability. Use the execution time to measure the move.
+4.2 Issuer spread
+1. Eligible bonds: senior unsecured, fixed coupon, 2 to 10 years to maturity, at least 250 million outstanding, not within 1 year of a call date, quoted on at least 80 percent of bars.
+2. Compute OAS per bond from the quote mid. Do not use price. Price mixes the rates move with the credit move.
+3. Aggregate to the issuer: duration-weighted mean of eligible bonds.
+4. Floor the spread at 10 bp before the log. Compute Delta log s_t.
+5. Mark a bar as updated when at least one eligible bond mid changed in the bar. Module A fits on updated bars only.
+4.3 Equity and factors
+1. Equity returns are mid-to-mid log returns at bar close.
+2. Factor model per issuer: market (SPY), sector ETF, and size (IWM for issuers below 5 billion market cap). Betas from a 60-day rolling regression on daily returns, applied to bars.
+3. r~^E is the residual of that model, cumulated over the horizon.
+4.4 Scale
+1. sigma_hat_t: EWMA of epsilon with a 2-day half-life.
+2. Floor sigma_hat at 1.4826 times the 20-day MAD of epsilon.
+4.5 Event filters
+Remove these bars from estimation and suppress the signal on them in production:
+• Earnings: from the close before the release to the close after.
+• Rating actions: the day of the action and the next day.
+• Macro releases (FOMC, CPI, NFP): 15 minutes before to 30 minutes after.
+• Index rebalance days for the credit index and the equity index.
+• Issuer corporate events (M&A, tender, exchange) when a news feed exists.
+5. Module A: abnormal bond move
+The abnormal move is the residual of the issuer spread change after the model removes the index, the rates, the issuer's own equity, and the bond's own lags.
+\Delta \log s_{i,t} = \alpha_i + \beta_{m,i}\,\Delta \log \mathrm{CDX}_t + \beta_{r,i}\,\Delta y_t + \sum_{k=0}^{K} \phi_{k,i}\, r^E_{i,t-k} + \sum_{j=1}^{J} \psi_{j,i}\,\Delta \log s_{i,t-j} + \varepsilon_{i,t}
+z_{i,t} = \frac{\varepsilon_{i,t}}{\hat\sigma_{i,t}}
+Specification:
+1. Fit per issuer on a rolling window of 120 trading days of updated bars. Refit daily after the close.
+2. K = 6 equity lags (30 minutes). J = 3 own lags.
+3. Estimator: Huber regression with ridge penalty lambda = 0.01 on the standardized regressors. Bond residuals have fat tails and OLS overweights the outliers.
+4. The k = 0 term is mandatory. Without the contemporaneous equity return the residual keeps the part of the bond move that the stock caused, and Module B then measures the equity's own autocorrelation.
+5. Keep a second residual z^raw from the same model without the equity terms. The gap z^raw - z reports how much of a move the equity already explained. Store both.
+6. Abnormal event: the first bar where |z| >= c_z with c_z = 2.5. Apply a 60-minute refractory period per issuer. Record t_0 as the report time of the quote that produced the crossing.
+7. Issuer-level z uses the issuer spread. Also compute z per bond for the curve-confirmation feature in Module C.
+Acceptance checks for Module A:
+• Residual autocorrelation at lags 1 to 6 is below 0.05 in absolute value for 90 percent of issuers.
+• The share of events that coincide with a filtered event window is below 10 percent after the filters.
+• The event rate per issuer is between 0.5 and 3 per week. Tune c_z within 2.0 to 3.0 to land in that range.
+6. Module B: propagation estimation
+Two predictive regressions on the event panel decide who adjusts after an abnormal move: the stock, the bond, or neither.
+\tilde r^E_{i,t_0,t_0+h} = \gamma_h\, z_{i,t_0} + u_{i,t_0+h}
+Z_{i,t_0,t_0+h} \equiv \frac{1}{\hat\sigma_{i,t_0}}\sum_{j=1}^{h} \varepsilon_{i,t_0+j} = \delta_h\, z_{i,t_0} + v_{i,t_0+h}
+Specification:
+1. Sample: all events from Module A outside the event filters, with the equity return measured from the equity mid at t_0 (availability time), not at the execution time.
+2. Horizons h: 1, 3, 6, 12, 26, 78 bars (1 day), 2 days, 5 days. Events after 15:30 start the horizon at the next open.
+3. Standard errors: two-way cluster by issuer and by date. Abnormal moves cluster on macro days and the horizons overlap.
+4. Estimate gamma_h and delta_h per state bucket (Module C), then as the pooled conditional model gamma_h(x).
+5. Diagnostic: the residual cross-correlation rho(k) = Corr(z_{i,t}, r~^E_{i,t+k}) for k from -12 to +12 bars on all bars, not only events. The lead claim needs rho(k) for k > 0 to differ from rho(-k).
+Decision rules per bucket:
+gamma_h
+delta_h
+Label
+Action
+Negative, stable in h, t-stat below -3
+Near zero
+Information, stock moves second
+Trade the stock
+Near zero
+Falls toward -1
+Liquidity pressure in the bond
+Fade the bond; no stock trade
+Near zero
+Near zero
+Already priced or no link
+No trade
+Negative at short h, back to zero at long h
+Near zero
+Transient equity overreaction
+No trade in v1; log for a reversal study
+Plateau horizon h*: the smallest h where gamma_h reaches 90 percent of its value at 5 days. Store h* per bucket. Default h* is 1 day until the estimate is stable.
+7. Module C: state features and conditional response
+The response gamma_h depends on the state at t_0. The state separates information from liquidity and tells how much of the credit move the equity market already knows.
+Feature
+Definition at t_0
+Expected effect on abs(gamma_h)
+Rating bucket
+IG; BB; B and below; distressed (spread above 1000 bp)
+Rises from IG to distressed
+Sign of z
+z > 0 (wider) or z < 0 (tighter)
+Larger for wider
+CDS confirmation
+Standardized Delta log c over the last 30 minutes has the same sign as z and exceeds 1 in absolute value
+Larger when confirmed
+Curve confirmation
+Share of the issuer's other eligible bonds with a same-sign per-bond z above 1 in the last 30 minutes
+Larger when the share exceeds 0.5
+Flow concentration
+Share of the largest TRACE customer print in the last 60 minutes of customer volume; plus net customer sell share
+Smaller when one print dominates (pressure)
+Flow type
+Informed versus uninformed flow score from the trade flow decomposition, when available
+Larger for informed flow
+Equity awareness
+Standardized change in ATM vol and 25-delta skew over the last 60 minutes; equity volume versus its intraday profile
+Smaller when the equity side already moved
+Structural loading
+Merton delta 1 - N(d1) from debt, market cap, and equity vol; or the empirical daily beta_E
+Larger for a larger loading
+Bond liquidity
+Quoted bid-ask in bp; days since the last trade; 20-day Amihud
+Smaller for illiquid bonds (more noise)
+Session bucket
+Pre-open, open, mid, close, post-close
+Pre-open is a separate bucket
+Macro regime
+CDX 20-day realized vol tercile
+Larger in the high tercile
+Conditional model:
+1. v1: linear interactions, gamma_h(x) = theta_h' x, with x standardized and the rating bucket as dummies. Fit by pooled panel regression of r~^E on z times x with the Module B clustering.
+2. Shrink theta_h toward the bucket means with a hierarchical prior. Buckets with fewer than 200 events inherit the parent bucket.
+3. v2: gradient-boosted trees on (z, x) with a monotone constraint on z. Keep v1 as the fallback and compare out of sample.
+4. Expected pattern: |gamma_h| is material only for HY, for wider moves, and with CDS confirmation. In IG the structural loading is near zero, so a spread residual implies a large equity move with a larger error. Do not invert the structural model to get the equity move. The regression shrinks the estimate by itself. Use the structural delta only as a prior on the loading.
+8. Module D: signal construction
+The signal is the part of the expected equity move that the stock has not yet realized, after four gates.
+At each bar t for each issuer with an open event (t_0 within the last h* bars):
+\hat\mu = \hat\gamma_{h^*}(x_{t_0})\, z_{t_0}, \qquad m_t = \hat\mu - \tilde r^E_{t_0,t}
+Gates, all must pass:
+1. Confidence gate: tau = mu_hat / SE(mu_hat) with |tau| >= 2. SE comes from the clustered covariance of theta_{h*}. Option: replace the t-ratio with a split conformal interval for r~^E over h*, calibrated on the last 250 days of events, and require the interval to exclude zero.
+2. Liquidity gate: Z_{t_0,t} > -0.5. If more than half of the bond shock has reverted, the move was pressure. Set the signal to zero and close any open position.
+3. Awareness gate: the equity awareness features at t_0 are below their 80th percentile. If the equity side already moved, there is no lead to trade.
+4. Cost gate: |m_t| >= kappa times the round-trip cost estimate for the intended size, with kappa = 2. Cost = equity half-spread plus square-root impact.
+Signal value and label:
+• S_{i,t} = m_t when all gates pass, else 0.
+• Direction: sign(S). A wider spread gives S < 0 and a short stock position. A tighter spread gives S > 0 and a long stock position.
+• Label: information when gates 1 to 3 pass; liquidity when gate 2 fails; already priced when gate 3 fails.
+• Ranking across issuers: |tau| times |m_t|. Cap the number of open names by the risk limits in Module E.
+Output record per bar: issuer, t_0, z, x, mu_hat, SE, m_t, Z, label, S, h*, and the gate that failed.
+9. Module E: position size
+Alpha mode sizes on the expected move and its variance. Hedge mode sizes on the dollar hedge ratio and the probability that the move is information.
+9.1 Alpha mode
+w_{i,t} = f \cdot \frac{m_t}{\hat\sigma^2_{E,h^*}}, \qquad f = 0.25
+1. sigma_hat_{E,h*} is the EWMA volatility of r~^E over h* bars, 10-day half-life.
+2. Cap |w| at the per-name limit (default 1 percent of the book) and the gross limit (default 20 percent of the book across all open names).
+3. Child orders at most 5 percent of the expected 30-minute equity volume.
+9.2 Hedge mode
+Q_{i} = -\,g_i \cdot \hat\beta_{E,i} \cdot \mathrm{MV}_{\mathrm{bond},i}
+1. Q_i is the dollar equity position that hedges the bond inventory of issuer i. A long bond position with a wider spread gives a short equity hedge.
+2. beta_hat_E: regression of the daily bond excess return on the daily equity return over 120 days. Sum the cross-covariances at lags -2 to +2 to correct the lead-lag bias at short horizons.
+3. Shrink: beta_hat_E = lambda beta_emp + (1 - lambda) beta_Merton, with lambda = n / (n + 60) for n days of data. beta_Merton = (1 - N(d1)) / N(d1) in dollar terms, from the issuer's capital structure.
+4. g_i in [0, 1] is the hedge fraction. Set g_i to the posterior probability that the event is information, from the Module C model, and 0 when gate 2 or gate 3 of Module D fails. The hedge covers the information component only. A liquidity move in the bond reverts, and a hedge against it adds risk.
+5. Rebalance the hedge at each bar while the event is open, with a 10 percent tolerance band on Q to limit turnover.
+10. Module F: entry and exit
+Enter at the first bar after the signal passes the gates. Exit on the first rule that fires.
+Entry:
+1. Trade only in equity hours. An event in the pre-open bucket enters in the opening auction, and only when that bucket has a validated gamma_h in Module B.
+2. Post passive at the mid for one bar, then cross the spread for the remainder.
+3. Do not enter when a scheduled event falls inside the horizon.
+Exit rules, first hit:
+Rule
+Condition
+Reason
+Horizon
+t >= t_0 + h*
+The plateau is reached
+Target
+r~^E_{t_0,t} has the sign of mu_hat and abs(r~^E) >= abs(mu_hat)
+The stock did the move
+Invalidate
+Z_{t_0,t} <= -0.5
+The bond move reverted; it was liquidity
+Stop
+r~^E_{t_0,t} has the sign opposite to mu_hat and abs(r~^E) >= 2 sigma_hat_{E,h*}
+Adverse move beyond the model
+Event
+A scheduled event enters the remaining horizon
+Public news changes the game
+New event
+A new abnormal move with the opposite sign
+The state changed; re-evaluate from the new t_0
+A new abnormal move with the same sign resets t_0 and mu_hat and keeps the position.
+11. Backtest and validation
+The backtest answers one question first: does gamma_h(x) exist out of sample in any bucket after costs? Only then does the execution work start.
+Protocol:
+1. Walk-forward: 12-month estimation window, 3-month test window, 3-month step. Refit Modules A, B, and C at each step.
+2. Availability: every input enters at its report time. No bar uses a quote, a print, or a fundamental that was not known at the bar close.
+3. Universe: point-in-time membership. Include issuers that later defaulted or delisted.
+4. Costs: equity half-spread plus square-root impact at the child-order size. Bond costs do not apply to the stock leg. In hedge mode, score the variance reduction of the hedged bond book instead of P&L.
+Report per bucket and per horizon:
+• gamma_hat_h and delta_hat_h with clustered confidence intervals.
+• Hit rate, mean r~^E at h* per unit of z, and the cumulative response curve over h.
+• Net P&L, Sharpe, turnover, and the number of events.
+• Capacity: the book size at which impact consumes half of the gross alpha.
+Falsification tests, all required before a go decision:
+• Placebo: shift every t_0 by a random 1 to 5 days. gamma_h must fall to zero.
+• Asymmetry: rho(k) for k > 0 must differ from rho(-k) in the buckets that trade.
+• Stability: the sign of gamma_h at h* is the same in at least 4 of 5 test windows per bucket.
+• Sensitivity: the result holds for c_z in {2.0, 2.5, 3.0}, K in {3, 6, 12}, and bar length in {1, 5, 15} minutes.
+• Multiple tests: many buckets inflate false positives. Control the false discovery rate at 10 percent across buckets and horizons, and require economic size above the cost gate.
+• Leakage check: re-run with the k = 0 equity term removed. The effect must grow. If it falls, the sample has a timestamp error.
+Go criteria for v1: at least one bucket with gamma_h* t-stat below -3 after the false discovery control, net Sharpe above 1.0 in that bucket, and the placebo at zero.
+12. Live operation and monitoring
+The live system recomputes z on every bond quote update and the full signal at every bar close. Model parameters refit after the close.
+Runtime:
+1. Latency budget: z within 1 second of a quote update; the signal record within 5 seconds of the bar close.
+2. Two processes: an event detector (Module A on the quote stream) and a signal engine (Modules C to F on the bar clock). The detector writes events to a queue; the engine reads the queue.
+3. Nightly: refit Module A per issuer, refresh the factor betas, recompute beta_E, and rebuild the reference data and the event calendar.
+4. Weekly: refit Modules B and C and update h* per bucket.
+Monitors, with an alarm threshold each:
+Monitor
+Check
+Alarm
+Quote staleness
+Share of eligible bonds with no mid update in 60 minutes
+Above 30 percent in equity hours
+Mapping
+Issuer to ticker and bond to issuer map changes
+Any change without a reference-data ticket
+Residual scale
+Daily realized scale of epsilon versus sigma_hat
+Ratio outside 0.5 to 2.0 for 3 days
+Event rate
+Events per issuer per week
+Outside 0.5 to 3
+Response drift
+Weekly gamma_h* per bucket versus the backtest value
+Sign flip, or 2 standard errors away
+Gate mix
+Share of events by label (information, liquidity, priced)
+Information share outside the backtest range
+P&L attribution
+Net P&L by bucket and by exit rule
+Loss beyond 2 times the backtest daily volatility
+Kill switches:
+• Per issuer: on any scheduled or detected event; on a mapping change; on a data-quality alarm.
+• Global: on a macro-day flag; on a response-drift alarm in a bucket that holds positions; on a gross exposure breach.
+13. Parameters and defaults
+Every parameter lives in one configuration file with the default below. The sensitivity tests in Section 11 cover the parameters marked with a range.
+Parameter
+Module
+Default
+Range to test
+Bar length
+4
+5 min
+1, 5, 15 min
+Spread floor
+4
+10 bp
+
+Factor beta window
+4
+60 days
+
+EWMA half-life for sigma_hat
+4
+2 days
+
+MAD floor window
+4
+20 days
+
+Estimation window (Module A)
+5
+120 days
+
+Equity lags K
+5
+6 bars
+3, 6, 12
+Own lags J
+5
+3 bars
+
+Ridge penalty lambda
+5
+0.01
+
+Event threshold c_z
+5
+2.5
+2.0, 2.5, 3.0
+Refractory period
+5
+60 min
+
+Horizons h
+6
+1, 3, 6, 12, 26, 78 bars, 2 d, 5 d
+
+Default plateau h*
+6
+1 day
+per bucket
+Minimum events per bucket
+7
+200
+
+Confidence gate tau
+8
+2.0
+
+Revert threshold on Z
+8
+-0.5
+
+Awareness percentile
+8
+80
+
+Cost multiple kappa
+8
+2.0
+
+Kelly fraction f
+9
+0.25
+
+Per-name limit
+9
+1 percent of book
+
+Gross limit
+9
+20 percent of book
+
+Participation cap
+9
+5 percent of 30-min volume
+
+Hedge beta window
+9
+120 days
+
+Hedge tolerance band
+9
+10 percent of Q
+
+Stop multiple
+10
+2 sigma_hat_E
+
+Walk-forward windows
+11
+12 m fit, 3 m test, 3 m step
+
+False discovery rate
+11
+10 percent
+
+14. Pseudo-code
+The per-bar update for one issuer. The nightly and weekly refits run outside this loop.
+def on_bar_close(issuer, t, cfg, models, state):
+    bar = load_bar(issuer, t)                      # inputs at report time <= t
+    if not bar.bond_updated:
+        return state                               # no new bond information
+
+    # Module A: abnormal move
+    eps = bar.dlog_spread - models.A[issuer].predict(bar)   # includes r_E lags 0..K
+    sigma = state.sigma.update(eps)
+    z = eps / sigma
+    if abs(z) >= cfg.c_z and not state.in_refractory(t) and not in_event_window(issuer, t):
+        state.open_event(t0=t, z=z, x=features(issuer, t))  # Module C features at t0
+
+    ev = state.event
+    if ev is None:
+        return state
+
+    # Module D: signal
+    h_star = models.h_star[ev.bucket]
+    mu, se = models.C.predict(ev.z, ev.x, h_star)             # gamma_hat(x) z, clustered SE
+    r_real = equity_excess_return(issuer, ev.t0, t)            # r~ since availability
+    Z = state.cum_residual(ev.t0, t) / ev.sigma0
+    m = mu - r_real
+
+    gates = {
+        "confidence": abs(mu / se) >= cfg.tau,
+        "liquidity": Z > cfg.revert_threshold,
+        "awareness": ev.x.awareness_pct < cfg.awareness_pct,
+        "cost": abs(m) >= cfg.kappa * cost_estimate(issuer, size_hint(m)),
+    }
+    label = classify(gates)
+    S = m if all(gates.values()) else 0.0
+
+    # Module E: size
+    if cfg.mode == "alpha":
+        w = clip(cfg.f * S / state.sigma_E(h_star) ** 2, cfg.limits)
+    else:  # hedge
+        g = models.C.p_information(ev.z, ev.x) if gates["liquidity"] and gates["awareness"] else 0.0
+        w = -g * models.beta_E[issuer] * bond_inventory_mv(issuer)
+
+    # Module F: exit checks run before any new order
+    if exit_rule_fired(ev, t, r_real, mu, Z, h_star, cfg):
+        w = 0.0
+        state.close_event()
+
+    emit_record(issuer, t, ev, z, mu, se, m, Z, label, S, w, gates)
+    route_order(issuer, target_weight=w, participation=cfg.participation_cap)
+    return state
+15. Pitfalls and open questions
+Most false leads in this signal come from the clock, not from the model.
+Pitfalls:
+1. Report time versus execution time. A TRACE print reported 10 minutes late looks like a lead over the stock. The backtest must use the report time for availability.
+2. Stale mids. A composite mid that updates once an hour produces a jump that the market made an hour earlier. Use own quotes where they exist, and the update flag everywhere.
+3. Price versus spread. A price move on a callable or a long bond mixes rates and credit. Use OAS.
+4. Issuer mapping. The bond issuer is often a finance subsidiary or a holding company. Map to the listed ultimate parent, and drop issuers with two listed share classes in v1.
+5. Public news. On earnings and rating actions both assets react to one public event. The question becomes speed, not information. Keep those events out.
+6. Survivorship. Defaulted and delisted names carry the largest moves. The universe must be point in time.
+7. Pre-open bond moves. They predict the equity open, but the stock could not move yet. That is a clock effect. Keep the bucket separate and score it against the opening auction price.
+8. Overlapping horizons. The 5-day horizon overlaps across events. Cluster by date or the t-stats overstate.
+9. The equity-leads prior. If Module B shows gamma_h near zero everywhere, the result is the published one and the signal does not exist. Do not tune c_z or the buckets until something appears.
+Open questions:
+[ ] CDS as the primary credit leg where it exists: does it dominate the cash bond residual in Module B?
+[ ] Bar length: does the effect live inside 5 minutes for the liquid HY names?
+[ ] Hedge mode: hedge the information component only, or the full beta_E with a shorter horizon?
+[ ] Loan-market signals (term loan quotes) as an extra confirmation feature for issuers with bank debt.
